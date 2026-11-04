@@ -1,0 +1,258 @@
+diff --git a/src/models/kv-pm.h b/src/models/kv-pm.h
+new file mode 100644
+index 0000000..25eb148
+--- /dev/null
++++ b/src/models/kv-pm.h
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The kcache-tools Authors
++
++#pragma once
++
++// Static post-RoPE key mean (env LLAMA_KV_POSTMEAN=<file> from `kcache-tools calib` / `calib-vl`). m[l][h] is the mean
++// post-RoPE key of layer l, KV head h, estimated offline on a calibration text. The model graph subtracts m from K
++// after RoPE, before the cache write. Supported for graphs without attention sinks or logit softcapping, and not
++// together with a K shift of the cache (context shift).
++//
++// File layout (little endian): char magic[4] = "KVPM", int32 version = 1, int32 n_layer, int32 n_head_kv,
++// int32 n_embd_head, then float32 m[n_layer][n_head_kv][n_embd_head].
++
++#include "llama-graph.h"
++#include "llama-impl.h"
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace kv_pm {
++
++struct mean_file {
++    int32_t            n_layer     = 0;
++    int32_t            n_head_kv   = 0;
++    int32_t            n_embd_head = 0;
++    std::vector<float> data; // [n_layer][n_head_kv][n_embd_head]
++};
++
++// path from LLAMA_KV_POSTMEAN, or nullptr when the feature is off
++inline const char * path() {
++    const char * p = getenv("LLAMA_KV_POSTMEAN");
++    return p && p[0] ? p : nullptr;
++}
++
++// loaded once per file name; aborts on a malformed file
++inline const mean_file & load(const char * fname) {
++    static std::mutex  mtx;
++    static std::string loaded_name;
++    static mean_file   mf;
++
++    std::lock_guard<std::mutex> lock(mtx);
++    if (loaded_name == fname) {
++        return mf;
++    }
++    FILE * f = fopen(fname, "rb");
++    GGML_ASSERT(f != nullptr && "LLAMA_KV_POSTMEAN: cannot open file");
++    char    magic[4];
++    int32_t hdr[4];
++    GGML_ASSERT(fread(magic, 1, 4, f) == 4 && memcmp(magic, "KVPM", 4) == 0 && "LLAMA_KV_POSTMEAN: bad magic");
++    GGML_ASSERT(fread(hdr, sizeof(int32_t), 4, f) == 4 && hdr[0] == 1 && "LLAMA_KV_POSTMEAN: bad version");
++    GGML_ASSERT(hdr[1] > 0 && hdr[2] > 0 && hdr[3] > 0 && "LLAMA_KV_POSTMEAN: bad shape");
++    mean_file r;
++    r.n_layer     = hdr[1];
++    r.n_head_kv   = hdr[2];
++    r.n_embd_head = hdr[3];
++    const size_t n = size_t(r.n_layer)*r.n_head_kv*r.n_embd_head;
++    r.data.resize(n);
++    GGML_ASSERT(fread(r.data.data(), sizeof(float), n, f) == n && "LLAMA_KV_POSTMEAN: short file");
++    fclose(f);
++    LLAMA_LOG_INFO("%s: static post-RoPE key mean from %s: %d layers, %d kv heads, head dim %d\n",
++            __func__, fname, r.n_layer, r.n_head_kv, r.n_embd_head);
++    mf          = std::move(r);
++    loaded_name = fname;
++    return mf;
++}
++
++// graph input holding all of m as one F32 tensor [n_embd_head, n_head_kv, n_layer]
++class input_mean : public llm_graph_input_i {
++public:
++    explicit input_mean(const mean_file & mf) : mf(mf) {}
++
++    void set_input(const llama_ubatch * ubatch) override {
++        GGML_UNUSED(ubatch);
++        if (m && m->buffer) {
++            ggml_backend_tensor_set(m, mf.data.data(), 0, ggml_nbytes(m));
++        }
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        GGML_UNUSED(params);
++        return true;
++    }
++
++    ggml_tensor *     m = nullptr;
++    const mean_file & mf;
++};
++
++struct state {
++    ggml_tensor * m = nullptr; // F32 [n_embd_head, n_head_kv, n_layer]
++};
++
++// returns false (and leaves st empty) when the feature is off
++inline bool init(state & st, llm_graph_context & g, int64_t n_layer, int64_t n_head_kv, int64_t n_embd_head) {
++    const char * fname = path();
++    if (fname == nullptr || g.cparams.training) {
++        return false;
++    }
++    const mean_file & mf = load(fname);
++    GGML_ASSERT(mf.n_layer == n_layer && mf.n_head_kv == n_head_kv && mf.n_embd_head == n_embd_head &&
++            "LLAMA_KV_POSTMEAN: shape does not match the model");
++
++    auto inp = std::make_unique<input_mean>(mf);
++    inp->m = ggml_new_tensor_3d(g.ctx0, GGML_TYPE_F32, n_embd_head, n_head_kv, n_layer);
++    ggml_set_input(inp->m);
++    st.m = inp->m;
++    g.res->add_input(std::move(inp));
++    return true;
++}
++
++// K [n_embd_head, n_head_kv, n_tokens] after RoPE -> K - m_l
++inline ggml_tensor * sub(const state & st, ggml_context * ctx, ggml_tensor * k, int64_t il) {
++    ggml_tensor * m = ggml_view_3d(ctx, st.m, st.m->ne[0], st.m->ne[1], 1, st.m->nb[1], st.m->nb[2], il*st.m->nb[2]);
++    return ggml_sub(ctx, k, m);
++}
++
++} // namespace kv_pm
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index f9c1251..082ad2e 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "kv-pm.h"
+ 
+ void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
+     uint32_t n_vocab = 0;
+@@ -123,6 +124,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // static post-RoPE key mean (see kv-pm.h)
++    kv_pm::state dpm;
++    const bool use_pm = kv_pm::init(dpm, *this, n_layer, n_head_kv, n_embd_head);
++
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+@@ -155,6 +160,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
++            if (use_pm) {
++                Kcur = kv_pm::sub(dpm, ctx0, Kcur, il);
++            }
++
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
+diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
+index d2cd8e2..99a3198 100644
+--- a/src/models/qwen2.cpp
++++ b/src/models/qwen2.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "kv-pm.h"
+ 
+ void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -68,6 +69,10 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // static post-RoPE key mean (see kv-pm.h)
++    kv_pm::state dpm;
++    const bool use_pm = kv_pm::init(dpm, *this, n_layer, n_head_kv, n_embd_head);
++
+     for (int il = 0; il < n_layer; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+@@ -95,6 +100,10 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
++            if (use_pm) {
++                Kcur = kv_pm::sub(dpm, ctx0, Kcur, il);
++            }
++
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
+diff --git a/src/models/qwen2vl.cpp b/src/models/qwen2vl.cpp
+index 778d1c8..de8b9ce 100644
+--- a/src/models/qwen2vl.cpp
++++ b/src/models/qwen2vl.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "kv-pm.h"
+ 
+ void llama_model_qwen2vl::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
+@@ -60,6 +61,10 @@ llama_model_qwen2vl::graph::graph(const llama_model & model, const llm_graph_par
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // static post-RoPE key mean (see kv-pm.h)
++    kv_pm::state dpm;
++    const bool use_pm = kv_pm::init(dpm, *this, n_layer, n_head_kv, n_embd_head);
++
+     for (int il = 0; il < n_layer; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+@@ -87,6 +92,10 @@ llama_model_qwen2vl::graph::graph(const llama_model & model, const llm_graph_par
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
++            if (use_pm) {
++                Kcur = kv_pm::sub(dpm, ctx0, Kcur, il);
++            }
++
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index c01f838..fef4d84 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "kv-pm.h"
+ 
+ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -82,6 +83,10 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // static post-RoPE key mean (see kv-pm.h)
++    kv_pm::state dpm;
++    const bool use_pm = kv_pm::init(dpm, *this, n_layer, n_head_kv, n_embd_head);
++
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+@@ -117,6 +122,10 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
++            if (use_pm) {
++                Kcur = kv_pm::sub(dpm, ctx0, Kcur, il);
++            }
++
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);

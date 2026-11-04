@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kcache-tools"
+version = "0.1.0"
+description = "Pre-deployment check and repair tools for low-bit K caches in llama.cpp"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.3", "transformers>=4.56", "safetensors", "numpy"]
+
+[project.optional-dependencies]
+layout = ["gguf>=0.19"]
+test = ["pytest"]
+
+[project.scripts]
+kcache-tools = "kcache_tools.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["kcache_tools*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

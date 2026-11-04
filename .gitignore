@@ -1,0 +1,38 @@
+# model weights, datasets and raw outputs never go into git
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.npy
+*.npz
+*.parquet
+*.jsonl
+models/
+data/
+raw/
+logs/
+*.log
+
+# internal notes
+PREDICTIONS*.md
+reg_*.md
+COORDINATION.md
+*对接*
+*交接*
+
+# environment
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+._*
+
+# build and tool outputs
+.pytest_cache/
+*.egg-info/
+build/
+*.kvpm
+*.kld
